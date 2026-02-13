@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 
 from magento_audit.base import Colors, MagentoEnvironment
@@ -36,7 +36,7 @@ class MagentoHealthReportGenerator:
         self.output_path = os.path.abspath(output_path)
         self.selected_modules = selected_modules
         self.report: Dict = {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "magento_root": self.env.root_path,
             "selected_modules": selected_modules,
             "modules": {},
