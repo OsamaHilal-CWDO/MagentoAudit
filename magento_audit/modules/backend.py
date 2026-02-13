@@ -112,6 +112,14 @@ class BackendProfilingModule:
         configured = self.runtime_options.get("log_path") or self.env.log_path
         if configured:
             paths.append(os.path.abspath(configured))
+        # Cloudways-style app logs: /home/master/applications/<app_name>/logs
+        paths.extend(
+            [
+                path
+                for path in glob.glob("/home/master/applications/*/logs")
+                if os.path.isdir(path)
+            ]
+        )
         paths.extend(
             [
                 "/var/log/mysql",

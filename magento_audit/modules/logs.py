@@ -28,6 +28,14 @@ class LogAnalysisModule:
         custom = self.runtime_options.get("log_path")
         if custom:
             base_paths.insert(0, os.path.abspath(custom))
+        # Cloudways-style app logs: /home/master/applications/<app_name>/logs
+        base_paths.extend(
+            [
+                path
+                for path in glob.glob("/home/master/applications/*/logs")
+                if os.path.isdir(path)
+            ]
+        )
         dedup = []
         for path in base_paths:
             if path and path not in dedup:
