@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Dict
+from urllib.request import Request, urlopen
 
 from ..base import Colors, MagentoEnvironment
 from ..utils import detect_cache_backend, parse_bool_status, parse_magento_table
@@ -13,8 +14,9 @@ class CacheAuditModule:
 
     name = "cache"
 
-    def __init__(self, env: MagentoEnvironment):
+    def __init__(self, env: MagentoEnvironment, runtime_options: Dict | None = None):
         self.env = env
+        self.runtime_options = runtime_options or {}
 
     def _parse_cache_status(self, output: str) -> Dict[str, bool]:
         rows = parse_magento_table(output)
@@ -54,6 +56,8 @@ class CacheAuditModule:
             "cache_backend": {},
             "full_page_cache_application": None,
             "full_page_cache_ttl": None,
+            "cache_headers": {},
+            "redis_cache_stats": {},
         }
 
         cache_status_result = self.env.run_magento("cache:status", timeout=90)
@@ -78,6 +82,19 @@ class CacheAuditModule:
             "default": {"type": default_backend, "options": default_options},
             "page_cache": {"type": page_backend, "options": page_options},
         }
+
+        if default_backend == "redis":
+            stats = self._get_redis_stats(default_options)
+            if stats:
+                result["redis_cache_stats"]["default"] = stats
+        if page_backend == "redis":
+            stats = self._get_redis_stats(page_options)
+            if stats:
+                result["redis_cache_stats"]["page_cache"] = stats
+
+        cache_headers = self._probe_cache_headers()
+        if cache_headers:
+            result["cache_headers"] = cache_headers
 
         # Magento config settings for full page cache.
         app_result = self.env.run_magento("config:show system/full_page_cache/caching_application")
@@ -105,6 +122,8 @@ class CacheAuditModule:
             result["status"] = "warning"
         elif default_backend == "filesystem":
             result["status"] = "warning"
+        elif cache_headers and cache_headers.get("cache_debug") in {"MISS", "BYPASS"}:
+            result["status"] = "warning"
 
         status_color = (
             Colors.GREEN
@@ -121,3 +140,50 @@ class CacheAuditModule:
         )
 
         return result
+
+    def _probe_cache_headers(self) -> Dict:
+        site_url = self.env.resolve_site_url()
+        if not site_url:
+            return {}
+        try:
+            req = Request(site_url, headers={"User-Agent": "MagentoHealthAudit/1.0"})
+            with urlopen(req, timeout=20) as response:
+                headers = {k.lower(): v for k, v in response.headers.items()}
+            return {
+                "x_magento_cache_debug": headers.get("x-magento-cache-debug"),
+                "x_magento_cache_control": headers.get("x-magento-cache-control"),
+                "cache_control": headers.get("cache-control"),
+                "cache_debug": (headers.get("x-magento-cache-debug") or "").strip().upper(),
+            }
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _get_redis_stats(self, options: Dict) -> Dict:
+        host = str(options.get("server") or "127.0.0.1")
+        port = str(options.get("port") or "6379")
+        db = str(options.get("database") or options.get("db") or "0")
+        cmd = ["redis-cli", "-h", host, "-p", port, "-n", db, "INFO", "stats"]
+        result = self.env.run_command(cmd, timeout=20)
+        if not result.ok:
+            return {"error": result.stderr or result.stdout or "redis-cli failed"}
+
+        stats = {}
+        for line in result.stdout.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if key in {"keyspace_hits", "keyspace_misses"}:
+                try:
+                    stats[key] = int(value)
+                except Exception:
+                    continue
+
+        hits = stats.get("keyspace_hits", 0)
+        misses = stats.get("keyspace_misses", 0)
+        total = hits + misses
+        if total > 0:
+            stats["hit_ratio_percent"] = round((hits / total) * 100, 2)
+        stats["host"] = host
+        stats["port"] = int(port)
+        stats["database"] = int(db) if db.isdigit() else db
+        return stats

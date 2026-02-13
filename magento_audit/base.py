@@ -9,6 +9,7 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 
 class Colors:
@@ -47,12 +48,17 @@ class MagentoEnvironment:
         magento_bin: str = "bin/magento",
         php_bin: str = "php",
         mysql_bin: str = "mysql",
+        site_url: Optional[str] = None,
+        log_path: Optional[str] = None,
     ):
         self.root_path = os.path.abspath(root_path)
         self.magento_bin = magento_bin
         self.php_bin = php_bin
         self.mysql_bin = mysql_bin
+        self.site_url = self._normalize_url(site_url)
+        self.log_path = os.path.abspath(log_path) if log_path else os.path.join(self.root_path, "var", "log")
         self._env_cache: Optional[Dict[str, Any]] = None
+        self._site_url_cache: Optional[str] = None
 
     @property
     def magento_bin_path(self) -> str:
@@ -112,6 +118,37 @@ class MagentoEnvironment:
         args = [self.magento_bin_path]
         args.extend(shlex.split(command))
         return self.run_command(args=args, timeout=timeout)
+
+    def _normalize_url(self, url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        cleaned = url.strip()
+        if not cleaned:
+            return None
+        parsed = urlparse(cleaned)
+        if not parsed.scheme:
+            cleaned = "https://" + cleaned
+            parsed = urlparse(cleaned)
+        if not parsed.netloc:
+            return None
+        return cleaned.rstrip("/") + "/"
+
+    def resolve_site_url(self) -> Optional[str]:
+        """Resolve the storefront base URL from args or Magento config."""
+        if self._site_url_cache:
+            return self._site_url_cache
+        if self.site_url:
+            self._site_url_cache = self.site_url
+            return self._site_url_cache
+
+        for path in ("web/secure/base_url", "web/unsecure/base_url"):
+            result = self.run_magento(f"config:show {path}", timeout=20)
+            if result.ok and result.stdout:
+                resolved = self._normalize_url(result.stdout.strip())
+                if resolved:
+                    self._site_url_cache = resolved
+                    return self._site_url_cache
+        return None
 
     def load_env_config(self) -> Dict[str, Any]:
         """Load app/etc/env.php as a Python dict via PHP JSON encoding."""

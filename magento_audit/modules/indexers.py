@@ -13,8 +13,9 @@ class IndexersAuditModule:
 
     name = "indexers"
 
-    def __init__(self, env: MagentoEnvironment):
+    def __init__(self, env: MagentoEnvironment, runtime_options: Dict | None = None):
         self.env = env
+        self.runtime_options = runtime_options or {}
 
     def _parse_mode_lines(self, output: str) -> List[Dict[str, str]]:
         rows = parse_magento_table(output)

@@ -26,8 +26,9 @@ class ExtensionsAuditModule:
 
     name = "extensions"
 
-    def __init__(self, env: MagentoEnvironment):
+    def __init__(self, env: MagentoEnvironment, runtime_options: Dict | None = None):
         self.env = env
+        self.runtime_options = runtime_options or {}
 
     def _is_third_party(self, module_name: str) -> bool:
         core_prefixes = ("Magento_", "Laminas_", "Zend_")
