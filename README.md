@@ -68,11 +68,47 @@ Comprehensive modular Magento 2 health and performance audit.
 ## Files
 
 - `magento_health_audit.py` - CLI entrypoint + phased orchestration
+- `bootstrap.py` - single-file downloader/runner for `curl | python3` workflows
 - `magento_audit/base.py` - shared Magento/DB command helpers
 - `magento_audit/recommendations.py` - recommendation engine
 - `magento_audit/modules/*.py` - audit modules
 
 ## Usage
+
+### Bootstrap usage (`curl | python3`)
+
+You do **not** need to copy/clone the whole repo manually on the server.
+Use `bootstrap.py` to download a tarball to a temp folder and run `magento_health_audit.py`.
+
+Public repo example:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/OWNER/REPO/REF/bootstrap.py" | \
+python3 - -- --magento-root /home/master/applications/db_name/public_html --phase phase1
+```
+
+Private repo example (token from env):
+
+```bash
+export GITHUB_TOKEN="ghp_xxx"
+curl -fsSL "https://raw.githubusercontent.com/OWNER/REPO/REF/bootstrap.py" | \
+python3 - --repo owner/private-repo --ref main -- --magento-root /home/master/applications/db_name/public_html --phase phase1
+```
+
+Cloudways-style logs example:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/OWNER/REPO/REF/bootstrap.py" | \
+python3 - -- \
+  --magento-root /home/master/applications/db_name/public_html \
+  --log-path /home/master/applications/db_name/logs \
+  --phase phase2
+```
+
+Recommended hardening:
+
+- Pin `--ref` to a commit SHA in production runs.
+- Keep the `--` separator so bootstrap args and audit args are clearly separated.
 
 Run default phase (`phase1`):
 
