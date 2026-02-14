@@ -208,8 +208,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-path",
-        default="/mnt/user-data/outputs",
-        help="Directory for JSON output report (default: /mnt/user-data/outputs).",
+        default="/tmp",
+        help="Directory for JSON output report (default: /tmp).",
     )
     parser.add_argument(
         "--site-url",

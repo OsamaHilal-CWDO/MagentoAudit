@@ -167,3 +167,5 @@ python3 magento_health_audit.py \
   --magento-root /path/to/magento \
   --output-path /tmp/reports
 ```
+
+If `--output-path` is omitted, reports are written to `/tmp` by default.

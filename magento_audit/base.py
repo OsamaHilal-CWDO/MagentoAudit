@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+import base64
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -201,13 +202,16 @@ class MagentoEnvironment:
         password = str(db.get("password") or "")
         database = str(db.get("dbname") or "")
         port = str(db.get("port") or "")
+        unix_socket = str(db.get("unix_socket") or "")
 
         if not user or not database:
             return False, [], "Incomplete database credentials in app/etc/env.php"
 
+        if host and ":" in host and host.count(":") == 1 and not port:
+            host, port = host.split(":", 1)
+
         args = [
             self.mysql_bin,
-            f"--host={host}",
             f"--user={user}",
             f"--database={database}",
             "--batch",
@@ -216,18 +220,91 @@ class MagentoEnvironment:
             "-e",
             query,
         ]
+        if host:
+            args.insert(1, f"--host={host}")
         if port:
             args.insert(3, f"--port={port}")
+        if unix_socket:
+            args.insert(3, f"--socket={unix_socket}")
 
         env = os.environ.copy()
         if password:
             env["MYSQL_PWD"] = password
 
         result = self.run_command(args=args, timeout=timeout, env=env)
-        if not result.ok:
-            error = result.stderr or result.stdout or "Unknown MySQL execution error"
-            return False, [], error
+        if result.ok:
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            return True, lines, ""
 
+        mysql_error = result.stderr or result.stdout or "Unknown MySQL execution error"
+
+        # Fallback: run the query via PHP PDO using the same env.php credentials.
+        pdo_ok, pdo_lines, pdo_error = self._run_mysql_query_via_php(query=query, timeout=timeout)
+        if pdo_ok:
+            return True, pdo_lines, ""
+
+        combined_error = (
+            f"MySQL CLI error: {mysql_error}; "
+            f"PHP PDO fallback error: {pdo_error}"
+        )
+        return False, [], combined_error
+
+    def _run_mysql_query_via_php(self, query: str, timeout: int = 45) -> Tuple[bool, List[str], str]:
+        """Fallback SQL execution via PHP PDO when mysql CLI auth/path fails."""
+        if not os.path.exists(self.env_php_path):
+            return False, [], "env.php not found for PDO fallback"
+
+        query_b64 = base64.b64encode(query.encode("utf-8")).decode("ascii")
+        env_path = self.env_php_path.replace("\\", "\\\\").replace('"', '\\"')
+        php_code = (
+            f'$cfg = include "{env_path}";'
+            '$db = $cfg["db"]["connection"]["default"] ?? null;'
+            'if (!$db) { fwrite(STDERR, "DB config missing"); exit(2); }'
+            '$host = (string)($db["host"] ?? "127.0.0.1");'
+            '$port = (string)($db["port"] ?? "");'
+            '$socket = (string)($db["unix_socket"] ?? "");'
+            '$user = (string)($db["username"] ?? "");'
+            '$pass = (string)($db["password"] ?? "");'
+            '$name = (string)($db["dbname"] ?? "");'
+            'if ($user === "" || $name === "") { fwrite(STDERR, "Incomplete DB credentials"); exit(2); }'
+            'if ($port === "" && strpos($host, ":") !== false && substr_count($host, ":") === 1) {'
+            '  $parts = explode(":", $host, 2);'
+            '  $host = $parts[0];'
+            '  $port = $parts[1];'
+            '}'
+            '$dsn = "mysql:";'
+            'if ($socket !== "") { $dsn .= "unix_socket=" . $socket . ";"; }'
+            'if ($host !== "") { $dsn .= "host=" . $host . ";"; }'
+            'if ($port !== "") { $dsn .= "port=" . $port . ";"; }'
+            '$dsn .= "dbname=" . $name . ";charset=utf8mb4";'
+            '$sql = base64_decode("' + query_b64 + '");'
+            'try {'
+            '  $pdo = new PDO($dsn, $user, $pass, ['
+            '    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,'
+            '    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_NUM,'
+            '  ]);'
+            '  $stmt = $pdo->query($sql);'
+            '  if ($stmt) {'
+            '    while (($row = $stmt->fetch(PDO::FETCH_NUM)) !== false) {'
+            '      $out = array_map(function ($v) {'
+            '        if ($v === null) { return "NULL"; }'
+            '        $s = (string)$v;'
+            '        $s = str_replace(["\\t", "\\n", "\\r"], " ", $s);'
+            '        return $s;'
+            '      }, $row);'
+            '      echo implode("\\t", $out) . PHP_EOL;'
+            '    }'
+            '  }'
+            '} catch (Throwable $e) {'
+            '  fwrite(STDERR, $e->getMessage());'
+            '  exit(1);'
+            '}'
+        )
+
+        result = self.run_command([self.php_bin, "-r", php_code], timeout=timeout)
+        if not result.ok:
+            error = result.stderr or result.stdout or "PDO fallback failed"
+            return False, [], error
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return True, lines, ""
 
