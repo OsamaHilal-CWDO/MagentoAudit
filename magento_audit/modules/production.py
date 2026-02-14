@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from urllib.request import Request, urlopen
@@ -65,9 +66,19 @@ class ProductionReadinessModule:
         mode_result = self.env.run_magento("deploy:mode:show", timeout=60)
         mode = "unknown"
         if mode_result.ok:
+            mode_match = re.search(
+                r"Current application mode:\s*([a-zA-Z_]+)",
+                mode_result.stdout,
+                re.IGNORECASE,
+            )
+            if mode_match:
+                mode = mode_match.group(1).strip().lower()
             for line in mode_result.stdout.splitlines():
                 if "Current application mode" in line:
-                    mode = line.split(":")[-1].strip().lower()
+                    mode_part = line.split("Current application mode:", 1)[-1].strip()
+                    mode_word = mode_part.split()[0].strip().strip(".")
+                    if mode_word:
+                        mode = mode_word.lower()
                     break
         result["deploy_mode"] = mode
 

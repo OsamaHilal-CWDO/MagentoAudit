@@ -36,6 +36,16 @@ def generate_recommendations(report: Dict) -> List[Dict]:
         )
 
     backend = modules.get("backend", {})
+    slowest_benchmarks = backend.get("slowest_benchmark_queries", [])
+    if slowest_benchmarks and (slowest_benchmarks[0].get("avg_ms") or 0) > 300:
+        top = slowest_benchmarks[0]
+        _add(
+            recs,
+            "high",
+            "backend",
+            f"Slow benchmark query hotspot: {top.get('name')}",
+            f"Average {top.get('avg_ms')}ms. Focus index tuning and EXPLAIN plan validation for this query path.",
+        )
     for query in backend.get("query_benchmarks", []):
         if query.get("status") == "critical":
             _add(
@@ -53,6 +63,14 @@ def generate_recommendations(report: Dict) -> List[Dict]:
             "backend",
             "Elevated MySQL slow query volume",
             f"Detected {slow_entries} timed slow-log entries in analysis window.",
+        )
+    if backend.get("query_plan_warnings"):
+        _add(
+            recs,
+            "high",
+            "backend",
+            "Benchmark query plan warnings",
+            f"{len(backend.get('query_plan_warnings', []))} warnings detected (full scans/filesort/temp tables).",
         )
 
     db = modules.get("database", {})
@@ -72,6 +90,20 @@ def generate_recommendations(report: Dict) -> List[Dict]:
             "database",
             "EXPLAIN plan warnings detected",
             f"{len(db.get('query_explain_warnings', []))} warnings (full scans/filesort/temp tables) were detected.",
+        )
+    heavy_log_tables = [
+        item
+        for item in db.get("log_related_tables", [])
+        if (item.get("size_mb") or 0) > 250 or (item.get("rows") or 0) > 1_000_000
+    ]
+    if heavy_log_tables:
+        top = heavy_log_tables[0]
+        _add(
+            recs,
+            "medium",
+            "database",
+            "Large log/report tables detected",
+            f"Table {top.get('table')} is {top.get('size_mb')}MB with {top.get('rows')} rows. Consider retention/cleanup policy.",
         )
 
     indexers = modules.get("indexers", {})
@@ -101,6 +133,14 @@ def generate_recommendations(report: Dict) -> List[Dict]:
             "Filesystem cache backend in use",
             "Consider Redis for lower latency and better concurrency under load.",
         )
+    if cache.get("cache_backend", {}).get("page_cache", {}).get("type") == "filesystem":
+        _add(
+            recs,
+            "medium",
+            "cache",
+            "Page cache is filesystem-backed",
+            "Consider Redis or Varnish-backed full-page cache for faster cache lookup and better scale.",
+        )
 
     sessions = modules.get("sessions", {})
     handler = sessions.get("save_handler")
@@ -116,12 +156,24 @@ def generate_recommendations(report: Dict) -> List[Dict]:
     logs = modules.get("logs", {})
     http_500 = logs.get("access_logs", {}).get("http_errors", {}).get("500", 0)
     if http_500 and http_500 > 20:
+        top_500_urls = logs.get("access_logs", {}).get("top_500_urls", [])
+        top_url = top_500_urls[0].get("path") if top_500_urls else "unknown"
         _add(
             recs,
             "high",
             "logs",
             "Frequent HTTP 500 responses",
-            f"{http_500} 500 responses found in analyzed logs.",
+            f"{http_500} 500 responses found. Top failing URL: {top_url}",
+        )
+    top_500_hours = logs.get("access_logs", {}).get("top_500_hours", [])
+    if top_500_hours:
+        peak = top_500_hours[0]
+        _add(
+            recs,
+            "medium",
+            "logs",
+            "Concentrated 500 error window detected",
+            f"Peak window {peak.get('hour')} with {peak.get('count')} HTTP 500 errors.",
         )
 
     profiler = modules.get("extension_profiler", {})

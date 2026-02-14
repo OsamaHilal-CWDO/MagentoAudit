@@ -9,6 +9,7 @@ import os
 import re
 import statistics
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -152,6 +153,8 @@ class BackendProfilingModule:
             "total_query_time_sec": 0.0,
         }
         fingerprints: Dict[str, Dict] = {}
+        duration_buckets = defaultdict(int)
+        hourly_timed_counts = defaultdict(int)
 
         for log_file in self._log_files():
             try:
@@ -183,6 +186,17 @@ class BackendProfilingModule:
                     if current_query_time is not None:
                         totals["timed_entries"] += 1
                         totals["total_query_time_sec"] += current_query_time
+                        if current_query_time >= 5:
+                            duration_buckets["gte_5s"] += 1
+                        elif current_query_time >= 2:
+                            duration_buckets["2s_to_5s"] += 1
+                        elif current_query_time >= 1:
+                            duration_buckets["1s_to_2s"] += 1
+                        else:
+                            duration_buckets["lt_1s"] += 1
+                        if current_time is not None:
+                            hour_bucket = current_time.strftime("%Y-%m-%d %H:00")
+                            hourly_timed_counts[hour_bucket] += 1
 
                     fingerprint = self._fingerprint_sql(query)
                     item = fingerprints.setdefault(
@@ -252,12 +266,20 @@ class BackendProfilingModule:
             item["max_query_time_sec"] = round(item["max_query_time_sec"], 4)
             item["total_query_time_sec"] = round(item["total_query_time_sec"], 4)
 
+        top_hourly = sorted(
+            [{"hour": hour, "count": count} for hour, count in hourly_timed_counts.items()],
+            key=lambda row: row["count"],
+            reverse=True,
+        )[:12]
+
         return {
             "period_days": days,
             "files_considered": self._log_files(),
             "entries": totals["entries"],
             "timed_entries": totals["timed_entries"],
             "total_query_time_sec": round(totals["total_query_time_sec"], 4),
+            "duration_buckets": dict(duration_buckets),
+            "top_hourly_timed_queries": top_hourly,
             "top_slow_fingerprints": top,
         }
 
@@ -390,6 +412,46 @@ class BackendProfilingModule:
 
         result["slow_query_log"] = self._parse_mysql_slow_logs(days=days, top_n=10)
 
+        # Surface the slowest benchmark queries for quick triage.
+        timed_benchmarks = [
+            item for item in result["query_benchmarks"] if item.get("avg_ms") is not None
+        ]
+        timed_benchmarks.sort(key=lambda item: item.get("avg_ms") or 0, reverse=True)
+        result["slowest_benchmark_queries"] = timed_benchmarks[:5]
+
+        query_plan_warnings = []
+        for benchmark in result["query_benchmarks"]:
+            explain = benchmark.get("explain") or {}
+            if explain.get("error"):
+                continue
+            full_scans = explain.get("full_scans") or []
+            if full_scans:
+                query_plan_warnings.append(
+                    {
+                        "query": benchmark.get("name"),
+                        "issue": "full_scan",
+                        "details": full_scans[:5],
+                    }
+                )
+            for table in explain.get("tables", []):
+                if table.get("using_filesort"):
+                    query_plan_warnings.append(
+                        {
+                            "query": benchmark.get("name"),
+                            "issue": "filesort",
+                            "details": {"table": table.get("table")},
+                        }
+                    )
+                if table.get("using_temporary_table"):
+                    query_plan_warnings.append(
+                        {
+                            "query": benchmark.get("name"),
+                            "issue": "temporary_table",
+                            "details": {"table": table.get("table")},
+                        }
+                    )
+        result["query_plan_warnings"] = query_plan_warnings
+
         any_critical_query = any(item.get("status") == "critical" for item in result["query_benchmarks"])
         product_attrs = result.get("eav_overhead", {}).get("product_attributes_total") or 0
         empty_ratio = result.get("eav_overhead", {}).get("varchar_empty_ratio_percent") or 0
@@ -397,7 +459,7 @@ class BackendProfilingModule:
 
         if any_critical_query:
             result["status"] = "critical"
-        elif product_attrs > 300 or empty_ratio > 30 or timed_entries > 500:
+        elif product_attrs > 300 or empty_ratio > 30 or timed_entries > 500 or query_plan_warnings:
             result["status"] = "warning"
 
         color = Colors.GREEN if result["status"] == "good" else Colors.ORANGE if result["status"] == "warning" else Colors.RED
@@ -406,4 +468,24 @@ class BackendProfilingModule:
             f"Product attributes: {product_attrs} | "
             f"Slow-log entries: {timed_entries}{Colors.RESET}"
         )
+        if result["slowest_benchmark_queries"]:
+            print(f"{Colors.CYAN}Top query benchmarks by average latency:{Colors.RESET}")
+            for item in result["slowest_benchmark_queries"][:3]:
+                print(
+                    f"  - {item.get('name')}: {item.get('avg_ms')}ms "
+                    f"(min {item.get('min_ms')} / max {item.get('max_ms')})"
+                )
+        top_fingerprints = result.get("slow_query_log", {}).get("top_slow_fingerprints", [])
+        if top_fingerprints:
+            print(f"{Colors.CYAN}Top MySQL slow query fingerprints:{Colors.RESET}")
+            for item in top_fingerprints[:3]:
+                print(
+                    f"  - {item.get('count')}x | avg {item.get('avg_query_time_sec')}s | "
+                    f"max {item.get('max_query_time_sec')}s"
+                )
+        if query_plan_warnings:
+            print(
+                f"{Colors.ORANGE}Query plan warnings detected: "
+                f"{len(query_plan_warnings)} (full scans/filesort/temp tables){Colors.RESET}"
+            )
         return result

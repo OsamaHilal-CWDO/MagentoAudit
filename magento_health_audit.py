@@ -180,7 +180,10 @@ class MagentoHealthReportGenerator:
                 sev = item.get("severity", "medium").upper()
                 module = item.get("module")
                 title = item.get("title")
+                detail = item.get("detail")
                 print(f"  - [{sev}] ({module}) {title}")
+                if detail:
+                    print(f"      -> {detail}")
 
     def _save_json_report(self) -> str:
         """Save report JSON to output path."""

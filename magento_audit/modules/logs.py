@@ -54,6 +54,24 @@ class LogAnalysisModule:
             return gzip.open(path, "rt", errors="ignore")
         return open(path, "r", encoding="utf-8", errors="ignore")
 
+    def _parse_access_datetime(self, line: str) -> Optional[datetime]:
+        # Common access format: [14/Feb/2026:07:20:40 +0000]
+        match = re.search(r"\[(\d{2}/[A-Za-z]{3}/\d{4}):(\d{2}:\d{2}:\d{2})\s*([+\-]\d{4})?\]", line)
+        if match:
+            raw = f"{match.group(1)} {match.group(2)}"
+            try:
+                return datetime.strptime(raw, "%d/%b/%Y %H:%M:%S")
+            except Exception:
+                pass
+        # Alternate plain format: [2026-02-14 07:20:40]
+        match = re.search(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]", line)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        return None
+
     def _analyze_php_slow_logs(self, days: int = 7) -> Dict:
         patterns = ["*slow*.log*", "php*.slow.log*", "php-fpm*.slow.log*"]
         files = self._glob_files(patterns)
@@ -122,8 +140,12 @@ class LogAnalysisModule:
         top.sort(key=lambda row: row["total_duration_sec"], reverse=True)
         return {"files": files, "entries": sum(item["count"] for item in top), "top_scripts": top[:15]}
 
-    def _extract_access_metrics(self, line: str) -> Dict[str, Optional[float]]:
-        path_match = re.search(r'"(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH)\s+([^" ]+)', line, re.I)
+    def _extract_access_metrics(self, line: str) -> Dict[str, object]:
+        request_match = re.search(
+            r'"(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH)\s+([^" ]+)',
+            line,
+            re.I,
+        )
         status_match = re.search(r'"\s+(\d{3})\s+', line)
         request_time_match = re.search(
             r"(?:request_time|upstream_response_time|duration|time)[:=\s]+(\d+(?:\.\d+)?)\s*(ms|msec|s|sec)?",
@@ -156,7 +178,8 @@ class LogAnalysisModule:
 
         cpu = safe_float(cpu_match.group(1)) if cpu_match else None
         return {
-            "path": path_match.group(1).split("?")[0] if path_match else None,
+            "method": request_match.group(1).upper() if request_match else None,
+            "path": request_match.group(2).split("?")[0] if request_match else None,
             "status": int(status_match.group(1)) if status_match else None,
             "request_time_sec": request_time,
             "memory_mb": memory_mb,
@@ -175,10 +198,13 @@ class LogAnalysisModule:
             return {"files": [], "entries": 0}
 
         cutoff = datetime.now() - timedelta(days=days)
-        date_regex = re.compile(r"\[(\d{2}/[A-Za-z]{3}/\d{4}):")
         route_stats = defaultdict(lambda: {"count": 0, "total_time": 0.0, "max_time": 0.0})
         route_groups = defaultdict(lambda: {"count": 0, "total_time": 0.0, "max_time": 0.0})
         errors = defaultdict(int)
+        error_urls = defaultdict(lambda: defaultdict(int))
+        error_hours = defaultdict(lambda: defaultdict(int))
+        method_500 = defaultdict(int)
+        response_time_buckets = {"lt_500ms": 0, "500ms_to_1s": 0, "1s_to_2s": 0, "2s_to_5s": 0, "gte_5s": 0}
         memory_samples = []
         cpu_samples = []
         parsed_entries = 0
@@ -190,14 +216,9 @@ class LogAnalysisModule:
                         line = raw_line.strip()
                         if not line:
                             continue
-                        date_match = date_regex.search(line)
-                        if date_match:
-                            try:
-                                log_date = datetime.strptime(date_match.group(1), "%d/%b/%Y")
-                                if log_date < cutoff:
-                                    continue
-                            except Exception:
-                                pass
+                        log_datetime = self._parse_access_datetime(line)
+                        if log_datetime and log_datetime < cutoff:
+                            continue
 
                         metrics = self._extract_access_metrics(line)
                         if not metrics:
@@ -205,13 +226,31 @@ class LogAnalysisModule:
                         parsed_entries += 1
                         status = metrics.get("status")
                         if status and status >= 400:
-                            errors[str(status)] += 1
+                            status_key = str(status)
+                            errors[status_key] += 1
+                            path_key = metrics.get("path") or "unknown"
+                            error_urls[status_key][path_key] += 1
+                            if log_datetime:
+                                hour_bucket = log_datetime.strftime("%Y-%m-%d %H:00")
+                                error_hours[status_key][hour_bucket] += 1
+                            if status == 500 and metrics.get("method"):
+                                method_500[str(metrics.get("method"))] += 1
 
                         path_key = metrics.get("path") or "unknown"
                         route_segment = path_key.strip("/").split("/")[0] if path_key else "root"
                         route_segment = route_segment or "root"
                         req_time = metrics.get("request_time_sec")
                         if req_time and req_time > 0:
+                            if req_time < 0.5:
+                                response_time_buckets["lt_500ms"] += 1
+                            elif req_time < 1:
+                                response_time_buckets["500ms_to_1s"] += 1
+                            elif req_time < 2:
+                                response_time_buckets["1s_to_2s"] += 1
+                            elif req_time < 5:
+                                response_time_buckets["2s_to_5s"] += 1
+                            else:
+                                response_time_buckets["gte_5s"] += 1
                             route_stats[path_key]["count"] += 1
                             route_stats[path_key]["total_time"] += req_time
                             route_stats[path_key]["max_time"] = max(route_stats[path_key]["max_time"], req_time)
@@ -252,12 +291,34 @@ class LogAnalysisModule:
             )
         top_route_groups.sort(key=lambda row: row["avg_time_sec"], reverse=True)
 
+        top_error_urls = {}
+        for code, paths in error_urls.items():
+            sorted_paths = sorted(paths.items(), key=lambda x: x[1], reverse=True)[:20]
+            top_error_urls[code] = [{"path": path, "count": count} for path, count in sorted_paths]
+
+        top_error_hours = {}
+        for code, buckets in error_hours.items():
+            sorted_hours = sorted(buckets.items(), key=lambda x: x[1], reverse=True)[:20]
+            top_error_hours[code] = [{"hour": hour, "count": count} for hour, count in sorted_hours]
+
+        top_500_urls = top_error_urls.get("500", [])
+        top_500_hours = top_error_hours.get("500", [])
+        total_500 = int(errors.get("500", 0))
+        error_rate_500 = round((total_500 / parsed_entries) * 100, 2) if parsed_entries > 0 else None
+
         return {
             "files": files,
             "entries": parsed_entries,
             "http_errors": dict(errors),
             "top_slow_routes": top_slow_routes[:20],
             "top_route_groups": top_route_groups[:20],
+            "top_error_urls": top_error_urls,
+            "top_error_hours": top_error_hours,
+            "top_500_urls": top_500_urls,
+            "top_500_hours": top_500_hours,
+            "http_500_by_method": dict(method_500),
+            "http_500_error_rate_percent": error_rate_500,
+            "response_time_buckets": response_time_buckets,
             "average_memory_mb": round(sum(memory_samples) / len(memory_samples), 2) if memory_samples else None,
             "max_memory_mb": round(max(memory_samples), 2) if memory_samples else None,
             "average_cpu_percent": round(sum(cpu_samples) / len(cpu_samples), 2) if cpu_samples else None,
@@ -273,9 +334,12 @@ class LogAnalysisModule:
         ]
 
         recurring_exceptions = defaultdict(int)
+        exception_types = defaultdict(int)
+        exception_hours = defaultdict(int)
         system_levels = defaultdict(int)
         cutoff = datetime.now() - timedelta(days=days)
         timestamp_regex = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+        exception_type_regex = re.compile(r"\b([A-Za-z0-9_\\\\]+Exception)\b")
 
         for path in files:
             if not os.path.exists(path):
@@ -298,6 +362,17 @@ class LogAnalysisModule:
                             normalized = re.sub(r"'[^']*'", "?", normalized)
                             if normalized:
                                 recurring_exceptions[normalized[:220]] += 1
+                            type_match = exception_type_regex.search(line)
+                            if type_match:
+                                exception_types[type_match.group(1)] += 1
+                            if ts_match:
+                                try:
+                                    hour = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%S").strftime(
+                                        "%Y-%m-%d %H:00"
+                                    )
+                                    exception_hours[hour] += 1
+                                except Exception:
+                                    pass
                         else:
                             if "CRITICAL" in line:
                                 system_levels["critical"] += 1
@@ -315,10 +390,22 @@ class LogAnalysisModule:
             key=lambda row: row["count"],
             reverse=True,
         )[:15]
+        top_exception_types = sorted(
+            [{"type": key, "count": count} for key, count in exception_types.items()],
+            key=lambda row: row["count"],
+            reverse=True,
+        )[:15]
+        top_exception_hours = sorted(
+            [{"hour": key, "count": count} for key, count in exception_hours.items()],
+            key=lambda row: row["count"],
+            reverse=True,
+        )[:12]
 
         return {
             "files": [path for path in files if os.path.exists(path)],
             "top_exceptions": top_exceptions,
+            "top_exception_types": top_exception_types,
+            "top_exception_hours": top_exception_hours,
             "system_levels": dict(system_levels),
         }
 
@@ -348,4 +435,19 @@ class LogAnalysisModule:
             f"HTTP 500s: {critical_errors} | "
             f"Exception patterns: {len(result['magento_logs'].get('top_exceptions', []))}{Colors.RESET}"
         )
+        top_500_urls = result["access_logs"].get("top_500_urls", [])
+        if top_500_urls:
+            print(f"{Colors.CYAN}Top URLs returning HTTP 500:{Colors.RESET}")
+            for row in top_500_urls[:5]:
+                print(f"  - {row.get('count')}x {row.get('path')}")
+        top_500_hours = result["access_logs"].get("top_500_hours", [])
+        if top_500_hours:
+            print(f"{Colors.CYAN}Peak HTTP 500 time buckets (hourly):{Colors.RESET}")
+            for row in top_500_hours[:5]:
+                print(f"  - {row.get('hour')}: {row.get('count')}")
+        top_exception_types = result["magento_logs"].get("top_exception_types", [])
+        if top_exception_types:
+            print(f"{Colors.CYAN}Top exception types:{Colors.RESET}")
+            for row in top_exception_types[:5]:
+                print(f"  - {row.get('type')}: {row.get('count')}")
         return result

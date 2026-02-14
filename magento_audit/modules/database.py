@@ -46,6 +46,7 @@ class DatabaseAuditModule:
             "session_cleanup": {},
             "retention": {},
             "query_explain_warnings": [],
+            "log_related_tables": [],
         }
 
         # DB size and table count
@@ -204,6 +205,41 @@ class DatabaseAuditModule:
                     continue
                 hotspots.append({"table": parts[0], "rows": safe_int(parts[1])})
         result["table_hotspots"] = hotspots
+
+        # Log/report-heavy tables that commonly bloat and impact query latency.
+        log_tables_query = (
+            "SELECT table_name, "
+            "ROUND((data_length + index_length) / 1024 / 1024, 2) AS size_mb, "
+            "table_rows "
+            "FROM information_schema.TABLES "
+            "WHERE table_schema = DATABASE() "
+            "AND ("
+            "table_name LIKE '%\\_log%' ESCAPE '\\' "
+            "OR table_name LIKE 'log\\_%' ESCAPE '\\' "
+            "OR table_name LIKE 'report\\_%' ESCAPE '\\' "
+            "OR table_name LIKE '%\\_report%' ESCAPE '\\' "
+            "OR table_name LIKE '%\\_visitor%' ESCAPE '\\' "
+            "OR table_name LIKE '%cron_schedule%' "
+            "OR table_name LIKE '%search_query%'"
+            ") "
+            "ORDER BY (data_length + index_length) DESC "
+            "LIMIT 25;"
+        )
+        ok, lines, _ = self.env.run_mysql_query(log_tables_query)
+        log_tables = []
+        if ok:
+            for line in lines:
+                parts = self._parse_tab_row(line)
+                if len(parts) < 3:
+                    continue
+                log_tables.append(
+                    {
+                        "table": parts[0],
+                        "size_mb": safe_float(parts[1]),
+                        "rows": safe_int(parts[2]),
+                    }
+                )
+        result["log_related_tables"] = log_tables
 
         # Fragmented tables (data_free overhead).
         frag_query = (
@@ -414,6 +450,8 @@ class DatabaseAuditModule:
             result["status"] = "warning"
         if orphaned.get("products_without_website", 0) > 0:
             result["status"] = "warning"
+        if any((item.get("size_mb") or 0) > 500 for item in log_tables):
+            result["status"] = "warning"
 
         status = result["status"]
         status_color = (
@@ -424,5 +462,20 @@ class DatabaseAuditModule:
             f"Buffer hit ratio: {hit_ratio if hit_ratio is not None else 'n/a'}% | "
             f"Missing indexes: {len(missing_indexes)}{Colors.RESET}"
         )
+        if missing_indexes:
+            print(f"{Colors.ORANGE}Missing expected indexes:{Colors.RESET}")
+            for item in missing_indexes[:10]:
+                print(f"  - {item.get('table')}.{item.get('index')}")
+        if explain_warnings:
+            print(f"{Colors.ORANGE}EXPLAIN warnings detected:{Colors.RESET}")
+            for warn in explain_warnings[:10]:
+                print(f"  - {warn.get('query')}: {warn.get('issue')}")
+        if log_tables:
+            print(f"{Colors.CYAN}Top log/report-related tables:{Colors.RESET}")
+            for item in log_tables[:5]:
+                print(
+                    f"  - {item.get('table')}: {item.get('size_mb')}MB, "
+                    f"rows={item.get('rows')}"
+                )
 
         return result
