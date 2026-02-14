@@ -145,7 +145,7 @@ def main(argv: List[str]) -> int:
         print("[bootstrap] downloading archive...", file=sys.stderr)
         download_archive(url=url, token=token, timeout=args.download_timeout, target_file=archive_file)
         print("[bootstrap] extracting archive...", file=sys.stderr)
-        project_root = extract_archive(archive_file=archive_file, output_dir=temp_root)
+        project_root = extract_archive(archive_path=archive_file, output_dir=temp_root)
 
         entrypoint = os.path.join(project_root, args.entrypoint)
         if not os.path.isfile(entrypoint):
